@@ -24,12 +24,16 @@ const articleRoutes = require('./routes/articleRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const analyticsRoutes = require('./routes/analyticsRoutes');
 const preferenceRoutes = require('./routes/preferenceRoutes');
+const goalRoutes = require('./routes/goalRoutes');
+const progressRoutes = require('./routes/progressRoutes');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/articles', articleRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/preferences', preferenceRoutes);
+app.use('/api/goals', goalRoutes);
+app.use('/api/progress', progressRoutes);
 
 // Create uploads directories if they don't exist
 const ensureUploadsDir = () => {
@@ -59,7 +63,26 @@ const startServer = async () => {
     // 2. Initialize Sequelize and sync models
     const db = require('./models');
     await db.sequelize.sync();
-    console.log('Database models synced automatically.');
+    console.log('Database models synced.');
+
+    // 3. Manually add new columns if they don't exist (avoids alter:true index bug)
+    const columnsToAdd = [
+      { name: 'price', sql: "ALTER TABLE `Articles` ADD COLUMN `price` DECIMAL(10,2) DEFAULT 0.00" },
+      { name: 'freePagesCount', sql: "ALTER TABLE `Articles` ADD COLUMN `freePagesCount` INT DEFAULT 0" },
+      { name: 'tableOfContents', sql: "ALTER TABLE `Articles` ADD COLUMN `tableOfContents` LONGTEXT" },
+    ];
+    for (const col of columnsToAdd) {
+      try {
+        await db.sequelize.query(col.sql);
+        console.log(`  ✔ Added column: ${col.name}`);
+      } catch (e) {
+        if (e.original && e.original.code === 'ER_DUP_FIELDNAME') {
+          // Column already exists, skip
+        } else {
+          console.warn(`  ⚠ Column ${col.name}: ${e.original?.sqlMessage || e.message}`);
+        }
+      }
+    }
 
     // Self-healing migration to extract text for existing uploaded PDFs
     // (Disabled as requested to skip OCR of existing PDFs on startup)
