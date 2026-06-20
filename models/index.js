@@ -19,6 +19,8 @@ db.Comment = require('./Comment')(sequelize, DataTypes);
 db.Analytics = require('./Analytics')(sequelize, DataTypes);
 db.Payment = require('./Payment')(sequelize, DataTypes);
 db.UserPreference = require('./UserPreference')(sequelize, DataTypes);
+db.ReadingGoal = require('./ReadingGoal')(sequelize, DataTypes);
+db.ArticleProgress = require('./ArticleProgress')(sequelize, DataTypes);
 
 // Relationships
 db.User.hasMany(db.Article, { foreignKey: 'authorId' });
@@ -40,5 +42,13 @@ db.Payment.belongsTo(db.User, { foreignKey: 'userId' });
 
 db.User.hasOne(db.UserPreference, { foreignKey: 'userId' });
 db.UserPreference.belongsTo(db.User, { foreignKey: 'userId' });
+
+db.User.hasMany(db.ReadingGoal, { foreignKey: 'userId' });
+db.ReadingGoal.belongsTo(db.User, { foreignKey: 'userId' });
+
+db.User.hasMany(db.ArticleProgress, { foreignKey: 'userId' });
+db.ArticleProgress.belongsTo(db.User, { foreignKey: 'userId' });
+db.Article.hasMany(db.ArticleProgress, { foreignKey: 'articleId' });
+db.ArticleProgress.belongsTo(db.Article, { foreignKey: 'articleId' });
 
 module.exports = db;

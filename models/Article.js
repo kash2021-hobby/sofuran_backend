@@ -68,10 +68,22 @@ module.exports = (sequelize, DataTypes) => {
     translations: {
       type: DataTypes.TEXT('long'),
     },
-    // "none", "processing", "completed", "failed"
     translationStatus: {
       type: DataTypes.STRING,
       defaultValue: 'none',
+    },
+    // Publisher monetization settings
+    price: {
+      type: DataTypes.DECIMAL(10, 2),
+      defaultValue: 0.00,
+    },
+    freePagesCount: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+    },
+    // Auto-generated table of contents / index
+    tableOfContents: {
+      type: DataTypes.TEXT('long'),
     },
     authorId: {
       type: DataTypes.INTEGER,
