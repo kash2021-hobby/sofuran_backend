@@ -91,12 +91,13 @@ router.post('/:id/classify', async (req, res) => {
     await Article.update({
       pageTypes: JSON.stringify(pageTypes),
       ocrStatus: 'processing',
-      status: 'published' // Auto-publish after classification
+      status: 'draft' // Remain as draft until Publisher Reviews and publishes with monetization settings
     }, { where: { id: article.id } });
 
     // Trigger background classified processing
     const { processClassifiedPages } = require('../utils/pdfProcessor');
-    processClassifiedPages(article.id, pageTypes, Article);
+    const agent = req.body.agent || 'default';
+    processClassifiedPages(article.id, pageTypes, Article, agent);
 
     res.json({ 
       message: 'Page classification saved. Processing started based on page types.',
@@ -111,8 +112,9 @@ router.post('/:id/classify', async (req, res) => {
 // Get all published articles
 router.get('/', async (req, res) => {
   try {
+    const whereClause = req.query.publisher === 'true' ? {} : { status: 'published' };
     const articles = await Article.findAll({
-      where: { status: 'published' },
+      where: whereClause,
       order: [['createdAt', 'DESC']],
       include: [{ model: User, attributes: ['name'] }]
     });
@@ -141,6 +143,25 @@ router.get('/:id', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error fetching article' });
+  }
+});
+
+// Update page content directly (e.g. text replacements)
+router.put('/:id/update-content', async (req, res) => {
+  try {
+    const article = await Article.findByPk(req.params.id);
+    if (!article) return res.status(404).json({ error: 'Article not found' });
+    
+    const { pageTexts } = req.body;
+    if (!pageTexts) return res.status(400).json({ error: 'pageTexts is required' });
+
+    article.pageTexts = pageTexts;
+    await article.save();
+    
+    res.json({ message: 'Content updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error updating content' });
   }
 });
 
@@ -199,12 +220,14 @@ router.post('/:id/reprocess', async (req, res) => {
       }
     } catch (e) {}
 
+    const agent = req.body.agent || 'default';
+
     if (pageTypes.length > 0) {
       const { processClassifiedPages } = require('../utils/pdfProcessor');
-      processClassifiedPages(article.id, pageTypes, Article);
+      processClassifiedPages(article.id, pageTypes, Article, agent);
     } else {
       const { renderPdfPages } = require('../utils/pdfProcessor');
-      renderPdfPages(filePath, article.id, Article);
+      renderPdfPages(filePath, article.id, Article, agent);
     }
 
     res.json({ message: 'Reprocessing started successfully', article });
@@ -215,20 +238,19 @@ router.post('/:id/reprocess', async (req, res) => {
 });
 
 // Reprocess Layout & OCR for a SINGLE page
-router.post('/:id/reprocess-page/:pageIndex', async (req, res) => {
+router.post('/:id/reprocess-page', async (req, res) => {
   try {
     const article = await Article.findByPk(req.params.id);
     if (!article) return res.status(404).json({ error: 'Article not found' });
     if (!article.uploadedPdf) return res.status(400).json({ error: 'No PDF associated with this article' });
 
-    const pageIndex = parseInt(req.params.pageIndex, 10);
+    const pageIndex = parseInt(req.body.pageIdx, 10);
     if (isNaN(pageIndex) || pageIndex < 0) return res.status(400).json({ error: 'Invalid page index' });
+    const agent = req.body.agent || 'default';
 
     const { processSingleClassifiedPage } = require('../utils/pdfProcessor');
-    // Non-blocking execution
-    processSingleClassifiedPage(article.id, pageIndex, Article);
-
-    res.json({ message: 'Reprocessing started for page ' + (pageIndex + 1) });
+    const updatedArticle = await processSingleClassifiedPage(article.id, pageIndex, Article, agent);
+    res.json({ message: 'Reprocessing complete for page ' + (pageIndex + 1), pageTexts: updatedArticle.pageTexts });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error triggering page reprocessing' });
@@ -273,7 +295,7 @@ router.post('/:id/reprocess-selected', async (req, res) => {
 
 /**
  * Translate article to Hindi and English.
- * POST body (optional): { targetLangs: ["hi", "en"], originalLanguage: "as" }
+ * POST body (optional): { targetLangs: ["hi", "en"], originalLanguage: "as", agent: "chatgpt-4" }
  */
 router.post('/:id/translate', async (req, res) => {
   try {
@@ -283,7 +305,8 @@ router.post('/:id/translate', async (req, res) => {
 
     const body = req.body || {};
     const targetLangs = body.targetLangs || ['hi', 'en'];
-    const originalLanguage = body.originalLanguage || article.originalLanguage || 'as';
+    const originalLanguage = body.originalLanguage || article.originalLanguage || 'auto';
+    const agent = body.agent || 'default';
 
     // Update original language if provided
     if (body.originalLanguage) {
@@ -292,7 +315,7 @@ router.post('/:id/translate', async (req, res) => {
 
     // Start translation in background (non-blocking)
     const { translateArticle } = require('../utils/translator');
-    translateArticle(article.id, targetLangs, Article);
+    translateArticle(article.id, targetLangs, Article, agent);
 
     res.json({
       message: `Translation started for article "${article.title}" → [${targetLangs.join(', ')}]`,
@@ -302,6 +325,52 @@ router.post('/:id/translate', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error triggering translation' });
+  }
+});
+
+
+/**
+ * STEP 4: Finalize, Monetize & Publish
+ * Body: { price: float, freePagesCount: int }
+ */
+router.post('/:id/monetize-and-publish', async (req, res) => {
+  try {
+    const article = await Article.findByPk(req.params.id);
+    if (!article) return res.status(404).json({ error: 'Article not found' });
+    
+    // Ensure OCR is actually complete before allowing publish
+    if (article.ocrStatus !== 'completed') {
+      return res.status(400).json({ error: 'Cannot publish until processing is fully completed.' });
+    }
+
+    const { price, freePagesCount } = req.body;
+    
+    await Article.update({
+      price: price || 0,
+      freePagesCount: freePagesCount || 0,
+      status: 'published' // Make it live!
+    }, { where: { id: article.id } });
+
+    res.json({ message: 'Book published successfully!' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error publishing book' });
+  }
+});
+
+// Like article
+router.post('/:id/like', async (req, res) => {
+  try {
+    const article = await Article.findByPk(req.params.id);
+    if (!article) return res.status(404).json({ error: 'Article not found' });
+    
+    article.likes = (article.likes || 0) + 1;
+    await article.save();
+    
+    res.json({ message: 'Article liked', likes: article.likes });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Server error liking article' });
   }
 });
 
