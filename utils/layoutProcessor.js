@@ -13,7 +13,7 @@ const callGeminiWithRetry = async (url, payload, retries = 5) => {
     try {
       const response = await axios.post(url, payload, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 60000 // 60s timeout for free tier
+        timeout: 180000 // 3-minute timeout for Pro model
       });
       return response;
     } catch (err) {
@@ -33,6 +33,8 @@ const callGeminiWithRetry = async (url, payload, retries = 5) => {
   }
 };
 
+
+
 /**
  * Extracts page layout, crops illustrations/graphics, and reconstructs
  * a responsive JSON flow of text and images.
@@ -43,10 +45,11 @@ const callGeminiWithRetry = async (url, payload, retries = 5) => {
  * @param {number} pageIndex - The page number index (1-based)
  * @returns {Promise<Array<Object>>} Structured flow: [{ type: 'text', content: '...' }, { type: 'image', src: '...', caption: '...' }]
  */
-const extractStructuredLayout = async (pageImagePath, ocrText, articleId, pageIndex) => {
+const extractStructuredLayout = async (pageImagePath, ocrText, articleId, pageIndex, agent = 'default') => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    
+    if (!geminiApiKey) {
       console.warn(`[LayoutProcessor] GEMINI_API_KEY is not defined. Skipping layout analysis for page ${pageIndex}.`);
       return [{ type: 'text', format: 'paragraph', content: ocrText }];
     }
@@ -58,8 +61,6 @@ const extractStructuredLayout = async (pageImagePath, ocrText, articleId, pageIn
 
     console.log(`[LayoutProcessor] Optimizing image size for page ${pageIndex} layout parsing...`);
     
-    // Token Cost Optimization: Resize to 512px. Since we provide OCR text, Gemini
-    // only needs a low-res image to understand layout bounding boxes. This saves massive token counts!
     const optimizedBuffer = await sharp(pageImagePath)
       .resize({ width: 512, withoutEnlargement: true })
       .jpeg({ quality: 60 })
@@ -67,78 +68,66 @@ const extractStructuredLayout = async (pageImagePath, ocrText, articleId, pageIn
 
     const imageBase64 = optimizedBuffer.toString('base64');
 
-    console.log(`[LayoutProcessor] Analyzing layout with Gemini Vision for page ${pageIndex}...`);
+    console.log(`[LayoutProcessor] Analyzing layout with ${agent} for page ${pageIndex}...`);
     
-    const prompt = `You are a professional magazine layout analyst. Analyze this scanned page image alongside the OCR text.
+    const prompt = `You are a professional magazine layout analyst, content classifier, and OCR cleanup engine. Analyze this scanned page image alongside the OCR text.
 
-Task 1: DETECT IMAGES/GRAPHICS — Find any illustrations, photographs, or decorative graphics. Do NOT select text regions.
-Task 2: FORMAT TEXT — Using BOTH the OCR text and the visual layout from the image, identify:
-  - HEADINGS: Text that appears larger, bolder, or more prominent than body text. These are titles, subtitles, section headers.
-  - BOLD TEXT: Sentences or phrases that are visually bolder/thicker than surrounding text. Wrap these in **double asterisks** in the content.
-  - PARAGRAPHS: Normal body text.
-  - POEMS/VERSES: Text with deliberate line-by-line arrangement.
-  - QUOTES: Indented or styled quotations.
-  - DIALOGUES: Conversational text.
-Task 3: AI TYPOGRAPHY — For EVERY text block, set the design properties to match how it appears in the original PDF.
+Task 1: CONTENT INTELLIGENCE — Classify the overall type of content on this page.
+Valid types: "novel", "story", "article", "educational", "biography", "textbook", "poetry", "qa".
 
-CRITICAL RULES FOR HEADINGS:
-- If text is visually LARGER than body text → format: "heading", fontSize: "xlarge" or "xxlarge"
-- If text is visually BOLD but same size as body → keep format: "paragraph" but set fontWeight: "bold"  
-- If text is a subheading (slightly larger) → format: "heading", fontSize: "large"
-- Bold sentences within paragraphs: wrap them in **asterisks** inside the content string.
+Task 2: DETECT IMAGES/GRAPHICS — Find any illustrations, photographs, or decorative graphics.
 
-Return JSON:
+Task 3: OCR CLEANUP & FORMATTING — Using BOTH the OCR text and the visual layout:
+  - MERGE BROKEN LINES: OCR often breaks single sentences into multiple lines. You MUST merge these back into continuous flowing paragraphs. Only create a new paragraph when there is a clear visual paragraph break in the image.
+  - FIX SPACING: Remove duplicate spaces and fix punctuation spacing.
+  - CLASSIFY BLOCKS: Identify each text region as one of the following formats:
+    * "heading": Titles, subtitles, section headers.
+    * "paragraph": Normal body text.
+    * "question": A question in a Q&A, textbook, or interview.
+    * "answer": The answer corresponding to a question.
+    * "quote": An indented or stylized quotation.
+    * "fact": A highlighted fact or important note.
+    * "list": Bulleted or numbered lists.
+    * "table": Tabular data.
+    * "poem": Poetry or verse.
+  - BOLD TEXT: Wrap visually bold phrases within the text in **double asterisks**.
+
+Task 4: AI TYPOGRAPHY — Set design properties to match the original PDF.
+  - Headings should be fontSize: "large", "xlarge", or "xxlarge".
+  - Body text MUST be fontSize: "base".
+
+Return JSON exactly matching this schema:
 {
+  "contentType": "educational",
+  "confidence": 0.95,
   "images": [{"id": 0, "box": [ymin,xmin,ymax,xmax], "caption": "..."}],
   "contentBlocks": [
     {"type": "image_ref", "imageId": 0},
     {
       "type": "text", 
       "format": "heading", 
-      "content": "This Is A Heading",
-      "design": {
-        "textAlign": "center", 
-        "fontFamily": "serif", 
-        "fontWeight": "bold",
-        "fontStyle": "normal",
-        "fontSize": "xlarge",
-        "color": "default",
-        "marginTop": "large"
-      }
+      "content": "Chapter 1",
+      "design": { "textAlign": "center", "fontSize": "xlarge" }
     },
     {
       "type": "text", 
       "format": "paragraph", 
-      "content": "Normal text with **some bold words** in between.",
-      "design": {
-        "textAlign": "justify", 
-        "fontFamily": "serif", 
-        "fontWeight": "normal",
-        "fontStyle": "normal",
-        "fontSize": "base",
-        "color": "default",
-        "marginTop": "medium"
-      }
+      "content": "Clean, continuous text with merged lines.",
+      "design": { "textAlign": "justify", "fontSize": "base" }
     }
   ]
 }
-RULES:
-- Look at the IMAGE carefully to detect which text is bold, large, or a heading. Do NOT rely only on OCR text.
-- Preserve all linebreaks (\\n) for poem, verse, dialogue, list.
-- For paragraphs, default textAlign should be "justify".
-- For ALL paragraph/body text blocks, ALWAYS use fontSize: "base". Do NOT use "small" for any text.
-- Only use fontSize "large", "xlarge", "xxlarge" for heading blocks.
-- ALWAYS use color: "default" for every block. Do NOT use "accent" or "muted".
-- Valid JSON only. No markdown wrapper.
-- design.textAlign options: left, center, right, justify
-- design.fontFamily options: serif, sans, monospace
-- design.fontWeight options: normal, semibold, bold
-- design.fontStyle options: normal, italic
-- design.fontSize options: base, large, xlarge, xxlarge
-- design.color: always "default"
-- design.marginTop options: small, medium, large`;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+RULES:
+- MERGE arbitrary OCR line breaks! This is critical for ebook rendering.
+- For paragraphs, default textAlign should be "justify" or "left".
+- ALWAYS use fontSize "base" for paragraphs, questions, answers, lists.
+- Valid JSON only. No markdown wrapper.
+- Normalize box coordinates to 0-1000 scale.`;
+
+    let textResponse = '';
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${geminiApiKey}`;
     const payload = {
       contents: [
         {
@@ -160,14 +149,17 @@ RULES:
     };
 
     const response = await callGeminiWithRetry(url, payload);
-
     const candidates = response?.data?.candidates;
     if (!candidates || candidates.length === 0) {
       console.warn('[LayoutProcessor] No response candidates from Gemini.');
-      return [{ type: 'text', format: 'paragraph', content: ocrText }];
+      return { contentType: 'article', confidence: 0, blocks: [{ type: 'text', format: 'paragraph', content: ocrText }] };
     }
+    textResponse = candidates[0].content.parts[0].text;
 
-    const textResponse = candidates[0].content.parts[0].text;
+    if (!textResponse) {
+       console.warn('[LayoutProcessor] Empty AI response.');
+       return { contentType: 'article', confidence: 0, blocks: [{ type: 'text', format: 'paragraph', content: ocrText }] };
+    }
     
     // Clean response to handle markdown block wrapper if any
     let cleanText = textResponse.trim();
@@ -226,7 +218,13 @@ RULES:
           imageMap[id] = {
             type: 'image',
             src: `/uploads/images/${cropsDirName}/${cropFileName}`,
-            caption: caption || ''
+            caption: caption || '',
+            layout: {
+              widthRatio: extractWidth / width,
+              heightRatio: extractHeight / height,
+              topRatio: top / height,
+              leftRatio: left / width
+            }
           };
         } catch (err) {
           console.error(`[LayoutProcessor] Failed to crop image ${id}:`, err);
@@ -280,12 +278,16 @@ RULES:
       }
     }
 
-    console.log(`[LayoutProcessor] Page ${pageIndex} layout analysis complete. Found ${detectedImages.length} images, ${contentFlow.filter(b => b.type === 'text').length} text blocks.`);
-    return contentFlow;
+    console.log(`[LayoutProcessor] Page ${pageIndex} analysis complete. Type: ${result.contentType || 'article'}, Found ${detectedImages.length} images, ${contentFlow.filter(b => b.type === 'text').length} text blocks.`);
+    return {
+      contentType: result.contentType || 'article',
+      confidence: result.confidence || 1.0,
+      blocks: contentFlow
+    };
 
   } catch (error) {
     console.error(`[LayoutProcessor] Error parsing layout on page ${pageIndex}:`, error.message || error);
-    return [{ type: 'text', format: 'paragraph', content: ocrText }];
+    return { contentType: 'article', confidence: 0, blocks: [{ type: 'text', format: 'paragraph', content: ocrText }] };
   }
 };
 
@@ -294,10 +296,11 @@ RULES:
  * Extracts poem title, author, body with preserved line breaks, stanza spacing,
  * and any illustrations/graphics on the page.
  */
-const extractPoemLayout = async (pageImagePath, ocrText, articleId, pageIndex) => {
+const extractPoemLayout = async (pageImagePath, ocrText, articleId, pageIndex, agent = 'default') => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+
+    if (!geminiApiKey) {
       console.warn(`[LayoutProcessor] GEMINI_API_KEY not set. Returning raw OCR for poem page ${pageIndex}.`);
       return [{ type: 'text', format: 'poem', content: ocrText }];
     }
@@ -307,7 +310,7 @@ const extractPoemLayout = async (pageImagePath, ocrText, articleId, pageIndex) =
       return [{ type: 'text', format: 'poem', content: ocrText }];
     }
 
-    console.log(`[LayoutProcessor] Analyzing POEM page ${pageIndex} with Gemini Vision...`);
+    console.log(`[LayoutProcessor] Analyzing POEM page ${pageIndex} with ${agent}...`);
 
     const optimizedBuffer = await sharp(pageImagePath)
       .resize({ width: 512, withoutEnlargement: true })
@@ -348,7 +351,7 @@ Return JSON:
   ]
 }
 RULES:
-- Preserve EVERY original linebreak (\n) and stanza break (\n\n) for poems. Do NOT merge lines.
+- Preserve EVERY original linebreak (\\n) and stanza break (\\n\\n) for poems. Do NOT merge lines.
 - OCR_TEXT_INPUT MAY CONTAIN ERRORS OR DUPLICATES. Use the visual image as the ultimate source of truth.
 - NEVER duplicate text. If the OCR contains duplicated "ghost" lines that only appear once in the visual image, DO NOT output them twice. Output exactly what is visibly present.
 - Fix any obvious OCR errors (like misread dates or characters) based on what you clearly see in the image.
@@ -361,7 +364,9 @@ RULES:
 - design.color options: default
 - design.marginTop options: small, medium, large`;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+    let cleanText = '';
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${geminiApiKey}`;
     const payload = {
       contents: [{
         parts: [
@@ -376,10 +381,9 @@ RULES:
     const response = await callGeminiWithRetry(url, payload);
     const candidates = response?.data?.candidates;
     if (!candidates || candidates.length === 0) {
-      return [{ type: 'text', format: 'poem', content: ocrText }];
+      return { contentType: 'poetry', confidence: 0, blocks: [{ type: 'text', format: 'poem', content: ocrText }] };
     }
-
-    let cleanText = candidates[0].content.parts[0].text.trim();
+    cleanText = candidates[0].content.parts[0].text.trim();
     if (cleanText.startsWith('```')) {
       cleanText = cleanText.replace(/^```(json)?/, '').replace(/```$/, '').trim();
     }
@@ -447,11 +451,15 @@ RULES:
     }
 
     console.log(`[LayoutProcessor] Poem page ${pageIndex} analysis complete. ${detectedImages.length} images, ${contentFlow.filter(b => b.type === 'text').length} text blocks.`);
-    return contentFlow;
+    return {
+      contentType: 'poetry',
+      confidence: 1.0,
+      blocks: contentFlow
+    };
 
   } catch (error) {
     console.error(`[LayoutProcessor] Error parsing poem page ${pageIndex}:`, error.message || error);
-    return [{ type: 'text', format: 'poem', content: ocrText }];
+    return { contentType: 'poetry', confidence: 0, blocks: [{ type: 'text', format: 'poem', content: ocrText }] };
   }
 };
 

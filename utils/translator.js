@@ -11,12 +11,15 @@ const LANG_NAMES = {
 
 /**
  * Call Gemini API with retry for rate limits.
+ * Uses exponential backoff for 503 errors.
  */
 const callGemini = async (prompt, retries = 5) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not set');
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+  // Use Pro model for highest quality translation
+  const model = process.env.GEMINI_TRANSLATION_MODEL || 'gemini-2.5-pro';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const payload = {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: { temperature: 0.3 },
@@ -26,28 +29,39 @@ const callGemini = async (prompt, retries = 5) => {
     try {
       const res = await axios.post(url, payload, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 90000,
+        timeout: 180000,
       });
       const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!text) throw new Error('Empty Gemini response');
       return text;
     } catch (err) {
       const status = err.response?.status;
-      const isTransient = status === 429 || status === 503 || err.code === 'ECONNABORTED';
+      const isTransient = status === 429 || status === 503 || status === 502 || status === 500 || err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET';
       if (attempt === retries || !isTransient) throw err;
-      const delay = status === 429 ? 65000 : attempt * 3000;
-      console.warn(`[Translator] Gemini error (${status || err.code}). Retry ${attempt}/${retries} in ${delay}ms...`);
+
+      // Exponential backoff: 429 = 65s flat, 503 = 10s × 2^attempt, timeout = 5s × attempt
+      let delay;
+      if (status === 429) {
+        delay = 65000;
+      } else if (status === 503) {
+        delay = Math.min(10000 * Math.pow(2, attempt - 1), 120000); // 10s, 20s, 40s, 80s, max 120s
+      } else {
+        delay = 5000 * attempt;
+      }
+      console.warn(`[Translator] Gemini error (${status || err.code}). Retry ${attempt}/${retries} in ${Math.round(delay / 1000)}s...`);
       await wait(delay);
     }
   }
 };
+
+
 
 /**
  * Translate a single text block's content from one language to another.
  * Returns translated text preserving paragraph structure.
  */
 const translateText = async (text, fromLang, toLang) => {
-  const fromName = LANG_NAMES[fromLang] || fromLang;
+  const fromName = fromLang === 'auto' ? 'its original source language (auto-detect)' : (LANG_NAMES[fromLang] || fromLang);
   const toName = LANG_NAMES[toLang] || toLang;
 
   const prompt = `You are a professional literary translator for magazines and books.
@@ -75,6 +89,7 @@ ${text}`;
  * @param {number} articleId - Article ID
  * @param {Array<string>} targetLangs - e.g. ['hi', 'en']
  * @param {Object} ArticleModel - Sequelize Article model
+ * @param {string} agent - AI agent to use
  */
 const translateArticle = async (articleId, targetLangs, ArticleModel) => {
   console.log(`[Translator] Starting translation for article ${articleId} → [${targetLangs.join(', ')}]`);
@@ -87,16 +102,11 @@ const translateArticle = async (articleId, targetLangs, ArticleModel) => {
       throw new Error('Article or pageTexts not found');
     }
 
-    const originalLang = article.originalLanguage || 'as';
+    const originalLang = article.originalLanguage || 'auto';
     const pageTextsArray = JSON.parse(article.pageTexts);
     const existingTranslations = article.translations ? JSON.parse(article.translations) : {};
 
     for (const targetLang of targetLangs) {
-      if (targetLang === originalLang) {
-        console.log(`[Translator] Skipping ${targetLang} — same as original.`);
-        continue;
-      }
-
       console.log(`[Translator] Translating to ${LANG_NAMES[targetLang] || targetLang}...`);
       const translatedPages = [];
 
@@ -107,27 +117,57 @@ const translateArticle = async (articleId, targetLangs, ArticleModel) => {
         // If it's a simple string
         if (typeof pageBlocks === 'string') {
           if (pageBlocks.trim()) {
-            const translated = await translateText(pageBlocks, originalLang, targetLang);
-            translatedPages.push(translated);
+            try {
+              const translated = await translateText(pageBlocks, originalLang, targetLang);
+              translatedPages.push(translated);
+            } catch (e) {
+              console.error(`[Translator] ⚠️ Page ${pageIdx + 1} translation failed: ${e.message}. Keeping original.`);
+              translatedPages.push(pageBlocks);
+            }
           } else {
             translatedPages.push(pageBlocks);
           }
+          // Cooldown between pages to avoid 503 overload
+          await wait(2000);
           continue;
         }
 
-        // If it's an array of blocks
+        // If it's an array of blocks OR the new structured object { contentType, blocks: [] }
+        let actualBlocks = [];
+        let isObjectFormat = false;
+
         if (Array.isArray(pageBlocks)) {
+          actualBlocks = pageBlocks;
+        } else if (pageBlocks && typeof pageBlocks === 'object' && Array.isArray(pageBlocks.blocks)) {
+          actualBlocks = pageBlocks.blocks;
+          isObjectFormat = true;
+        }
+
+        if (actualBlocks.length > 0) {
           const translatedBlocks = [];
-          for (const block of pageBlocks) {
-            if (block.type === 'text' && block.content && block.content.trim()) {
-              const translated = await translateText(block.content, originalLang, targetLang);
-              translatedBlocks.push({ ...block, content: translated });
+          for (const block of actualBlocks) {
+            if (block.type === 'text' && block.content && String(block.content).trim()) {
+              try {
+                const translated = await translateText(String(block.content), originalLang, targetLang);
+                translatedBlocks.push({ ...block, content: translated });
+              } catch (e) {
+                console.error(`[Translator] ⚠️ Block translation failed on page ${pageIdx + 1}: ${e.message}. Keeping original.`);
+                translatedBlocks.push({ ...block });
+              }
             } else {
               // Images, covers, etc. — keep as-is
               translatedBlocks.push(block);
             }
           }
-          translatedPages.push(translatedBlocks);
+          
+          if (isObjectFormat) {
+            translatedPages.push({ ...pageBlocks, blocks: translatedBlocks });
+          } else {
+            translatedPages.push(translatedBlocks);
+          }
+          
+          // Cooldown between pages to avoid 503 overload
+          await wait(2000);
           continue;
         }
 

@@ -99,7 +99,7 @@ const renderPdfPagesOnly = async (filePath, articleId, Article) => {
  * @param {string[]} pageTypes - Array of page types: "cover", "poem", "normal"
  * @param {Object} Article - Sequelize Article model
  */
-const processClassifiedPages = async (articleId, pageTypes, Article) => {
+const processClassifiedPages = async (articleId, pageTypes, Article, agent = 'default') => {
   try {
     const article = await Article.findByPk(articleId);
     if (!article || !article.uploadedPdf) {
@@ -117,7 +117,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
       pageTypes: JSON.stringify(pageTypes)
     }, { where: { id: articleId } });
 
-    console.log(`[Processor] Starting classified processing for article ${articleId} (${pageUrls.length} pages)...`);
+    console.log(`[Processor] Starting classified processing for article ${articleId} (Agent: ${agent}, ${pageUrls.length} pages)...`);
 
     // Check for OCR availability
     let useOcr = false;
@@ -153,10 +153,11 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
 
       if (pageType === 'cover') {
         // COVER: No OCR, no Gemini. Just store the page image reference.
-        pageTexts.push([{
-          type: 'cover',
-          src: pageUrls[i]
-        }]);
+        pageTexts.push({
+          contentType: 'cover',
+          confidence: 1.0,
+          blocks: [{ type: 'cover', src: pageUrls[i] }]
+        });
         console.log(`[Processor] Page ${pageNum}: Cover page — using raw image.`);
 
       } else if (pageType === 'poem') {
@@ -165,7 +166,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
         if (useOcr && pageImagePath && fs.existsSync(pageImagePath)) {
           try {
             console.log(`[Processor] Running OCR on poem page ${pageNum}...`);
-            const { stdout } = await execPromise(`tesseract "${pageImagePath}" stdout -l asm+ben --oem 1 --psm 3`);
+            const { stdout } = await execPromise(`tesseract "${pageImagePath}" stdout -l eng+asm+ben --oem 1 --psm 3`);
             pageRawText = stdout.trim();
           } catch (err) {
             console.error(`[Processor] OCR failed for poem page ${pageNum}:`, err);
@@ -180,10 +181,14 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
         }
 
         if (pageImagePath && fs.existsSync(pageImagePath)) {
-          const poemFlow = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum);
+          const poemFlow = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
           pageTexts.push(poemFlow);
         } else {
-          pageTexts.push([{ type: 'text', format: 'poem', content: pageRawText }]);
+          pageTexts.push({
+            contentType: 'poetry',
+            confidence: 1.0,
+            blocks: [{ type: 'text', format: 'poem', content: pageRawText }]
+          });
         }
 
         // No artificial rate limit needed for paid tier (handled by automatic retry logic if necessary)
@@ -194,7 +199,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
         if (useOcr && pageImagePath && fs.existsSync(pageImagePath)) {
           try {
             console.log(`[Processor] Running OCR on page ${pageNum}...`);
-            const { stdout } = await execPromise(`tesseract "${pageImagePath}" stdout -l asm+ben --oem 1 --psm 3`);
+            const { stdout } = await execPromise(`tesseract "${pageImagePath}" stdout -l eng+asm+ben --oem 1 --psm 3`);
             pageRawText = stdout.trim();
           } catch (err) {
             console.error(`[Processor] OCR failed for page ${pageNum}:`, err);
@@ -209,10 +214,14 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
         }
 
         if (pageImagePath && fs.existsSync(pageImagePath)) {
-          const layoutFlow = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum);
+          const layoutFlow = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
           pageTexts.push(layoutFlow);
         } else {
-          pageTexts.push([{ type: 'text', format: 'paragraph', content: pageRawText }]);
+          pageTexts.push({
+            contentType: 'article',
+            confidence: 1.0,
+            blocks: [{ type: 'text', format: 'paragraph', content: pageRawText }]
+          });
         }
 
         // No artificial rate limit needed for paid tier (handled by automatic retry logic if necessary)
@@ -228,24 +237,44 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
 
     // Fetch latest article for summary check
     const articleInstance = await Article.findByPk(articleId);
-    const isTempSummary = !articleInstance.summary || 
-      articleInstance.summary.includes('Preparing high-fidelity') || 
-      articleInstance.summary === 'Processing digital magazine pages...';
+    
+    if (articleInstance) {
+      const isTempSummary = !articleInstance.summary || 
+        articleInstance.summary.includes('Preparing high-fidelity') || 
+        articleInstance.summary === 'Processing digital magazine pages...';
 
-    const finalSummary = isTempSummary 
-      ? `A high-fidelity digital magazine edition with ${pageUrls.length} pages.`
-      : articleInstance.summary;
+      const finalSummary = isTempSummary 
+        ? `A high-fidelity digital magazine edition with ${pageUrls.length} pages.`
+        : articleInstance.summary;
 
-    // Final update
-    await Article.update({
-      pageTexts: JSON.stringify(pageTexts),
-      heroImage: heroImage,
-      readTime: Math.max(1, Math.ceil(pageUrls.length * 1.5)),
-      summary: finalSummary,
-      ocrStatus: 'completed'
-    }, { where: { id: articleId } });
+      // Auto-generate Table of Contents / Index
+      const tableOfContents = [];
+      pageTexts.forEach((pageData, idx) => {
+        const pageBlocks = pageData && Array.isArray(pageData.blocks) ? pageData.blocks : (Array.isArray(pageData) ? pageData : []);
+        pageBlocks.forEach(block => {
+          if (block.type === 'text' && (block.format === 'heading' || block.format === 'poem_title')) {
+            const title = block.content.replace(/\n/g, ' ').trim();
+            if (title && title.length > 2) {
+              tableOfContents.push({ title, pageIndex: idx, pageNumber: idx + 1 });
+            }
+          }
+        });
+      });
 
-    console.log(`[Processor] Article ${articleId} fully processed and ready.`);
+      // Final update
+      await Article.update({
+        pageTexts: JSON.stringify(pageTexts),
+        heroImage: heroImage,
+        readTime: Math.max(1, Math.ceil(pageUrls.length * 1.5)),
+        summary: finalSummary,
+        ocrStatus: 'completed',
+        tableOfContents: JSON.stringify(tableOfContents)
+      }, { where: { id: articleId } });
+
+      console.log(`[Processor] Article ${articleId} fully processed and ready.`);
+    } else {
+      console.log(`[Processor] Article ${articleId} no longer exists. Skipping final save.`);
+    }
 
   } catch (error) {
     console.error(`[Processor] Error processing classified pages for article ${articleId}:`, error);
@@ -256,7 +285,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article) => {
 /**
  * STEP 2.5: Reprocess a Single Page
  */
-const processSingleClassifiedPage = async (articleId, pageIndex, Article) => {
+const processSingleClassifiedPage = async (articleId, pageIndex, Article, agent = 'default') => {
   try {
     const article = await Article.findByPk(articleId);
     if (!article || !article.uploadedPdf) return;
@@ -299,7 +328,7 @@ const processSingleClassifiedPage = async (articleId, pageIndex, Article) => {
       let pageRawText = '';
       if (useOcr && pageImagePath && fs.existsSync(pageImagePath)) {
         try {
-          const { stdout } = await execPromise(`tesseract "${pageImagePath}" stdout -l asm+ben --oem 1 --psm 3`);
+          const { stdout } = await execPromise(`tesseract "${pageImagePath}" stdout -l eng+asm+ben --oem 1 --psm 3`);
           pageRawText = stdout.trim();
         } catch (err) {}
       } else {
@@ -311,9 +340,9 @@ const processSingleClassifiedPage = async (articleId, pageIndex, Article) => {
 
       if (pageImagePath && fs.existsSync(pageImagePath)) {
         if (pageType === 'poem') {
-          newPageResult = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum);
+          newPageResult = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
         } else {
-          newPageResult = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum);
+          newPageResult = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
         }
       } else {
         newPageResult = [{ type: 'text', format: pageType === 'poem' ? 'poem' : 'paragraph', content: pageRawText }];
@@ -328,9 +357,11 @@ const processSingleClassifiedPage = async (articleId, pageIndex, Article) => {
     }, { where: { id: articleId } });
 
     console.log(`[Processor] Successfully reprocessed page ${pageNum}`);
+    return await Article.findByPk(articleId);
 
   } catch (err) {
     console.error(`[Processor] Error reprocessing single page ${pageIndex}:`, err);
+    throw err;
   }
 };
 
@@ -338,7 +369,7 @@ const processSingleClassifiedPage = async (articleId, pageIndex, Article) => {
  * Legacy: Background renderer for backward compatibility (used by reprocess).
  * Processes all pages as "normal" type.
  */
-const renderPdfPages = async (filePath, articleId, Article) => {
+const renderPdfPages = async (filePath, articleId, Article, agent = 'default') => {
   // First render the page images
   await renderPdfPagesOnly(filePath, articleId, Article);
   
@@ -347,7 +378,7 @@ const renderPdfPages = async (filePath, articleId, Article) => {
   const pageUrls = article.pages ? JSON.parse(article.pages) : [];
   const allNormal = pageUrls.map(() => 'normal');
   
-  await processClassifiedPages(articleId, allNormal, Article);
+  await processClassifiedPages(articleId, allNormal, Article, agent);
 };
 
 // Self-healing migration to extract text for existing uploaded PDFs
