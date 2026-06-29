@@ -4,6 +4,20 @@ const multer = require('multer');
 const path = require('path');
 const { Article, User } = require('../models');
 const { processPdf } = require('../utils/pdfProcessor');
+const jwt = require('jsonwebtoken');
+
+const authenticatePublisher = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'supersecretjwtkey123');
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(403).json({ error: 'Invalid token' });
+  }
+};
 
 // Multer setup for PDF upload
 const storage = multer.diskStorage({
@@ -20,7 +34,7 @@ const upload = multer({ storage });
  * STEP 1: Upload PDF — renders pages to images, returns thumbnails for classification.
  * Does NOT start OCR/Gemini processing. Publisher must classify pages first.
  */
-router.post('/upload-pdf', upload.single('pdf'), async (req, res) => {
+router.post('/upload-pdf', authenticatePublisher, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file uploaded' });
@@ -39,7 +53,7 @@ router.post('/upload-pdf', upload.single('pdf'), async (req, res) => {
       status: 'draft', // Stay as draft until classification + processing is done
       uploadedPdf: req.file.filename,
       ocrStatus: 'processing', // Temporarily processing while we render page images
-      authorId: 1,
+      authorId: req.user.id,
       pageCount: pdfData.pageCount,
       pages: JSON.stringify([])
     });
@@ -62,9 +76,9 @@ router.post('/upload-pdf', upload.single('pdf'), async (req, res) => {
  * STEP 2: Classify pages — publisher assigns type to each page, then processing begins.
  * Body: { pageTypes: ["cover", "normal", "poem", "normal", ...] }
  */
-router.post('/:id/classify', async (req, res) => {
+router.post('/:id/classify', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
 
     const { pageTypes } = req.body;
@@ -96,8 +110,7 @@ router.post('/:id/classify', async (req, res) => {
 
     // Trigger background classified processing
     const { processClassifiedPages } = require('../utils/pdfProcessor');
-    const agent = req.body.agent || 'default';
-    processClassifiedPages(article.id, pageTypes, Article, agent);
+    processClassifiedPages(article.id, pageTypes, Article);
 
     res.json({ 
       message: 'Page classification saved. Processing started based on page types.',
@@ -112,7 +125,20 @@ router.post('/:id/classify', async (req, res) => {
 // Get all published articles
 router.get('/', async (req, res) => {
   try {
-    const whereClause = req.query.publisher === 'true' ? {} : { status: 'published' };
+    let whereClause = { status: 'published' };
+    
+    // If it's a publisher dashboard request, verify token and filter by their own articles
+    if (req.query.publisher === 'true') {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'supersecretjwtkey123');
+        whereClause = { authorId: decoded.id };
+      } catch (error) {
+        return res.status(403).json({ error: 'Invalid token' });
+      }
+    }
     const articles = await Article.findAll({
       where: whereClause,
       order: [['createdAt', 'DESC']],
@@ -147,9 +173,9 @@ router.get('/:id', async (req, res) => {
 });
 
 // Update page content directly (e.g. text replacements)
-router.put('/:id/update-content', async (req, res) => {
+router.put('/:id/update-content', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
     
     const { pageTexts } = req.body;
@@ -166,10 +192,10 @@ router.put('/:id/update-content', async (req, res) => {
 });
 
 // Delete article
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', authenticatePublisher, async (req, res) => {
   const fs = require('fs');
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
 
     // Clean up filesystem files (PDF and extracted images folder)
@@ -195,9 +221,9 @@ router.delete('/:id', async (req, res) => {
 });
 
 // Reprocess Layout & OCR for a single article manually
-router.post('/:id/reprocess', async (req, res) => {
+router.post('/:id/reprocess', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
     if (!article.uploadedPdf) return res.status(400).json({ error: 'No PDF associated with this article' });
 
@@ -220,14 +246,12 @@ router.post('/:id/reprocess', async (req, res) => {
       }
     } catch (e) {}
 
-    const agent = req.body.agent || 'default';
-
     if (pageTypes.length > 0) {
       const { processClassifiedPages } = require('../utils/pdfProcessor');
-      processClassifiedPages(article.id, pageTypes, Article, agent);
+      processClassifiedPages(article.id, pageTypes, Article);
     } else {
       const { renderPdfPages } = require('../utils/pdfProcessor');
-      renderPdfPages(filePath, article.id, Article, agent);
+      renderPdfPages(filePath, article.id, Article);
     }
 
     res.json({ message: 'Reprocessing started successfully', article });
@@ -238,9 +262,9 @@ router.post('/:id/reprocess', async (req, res) => {
 });
 
 // Reprocess Layout & OCR for a SINGLE page
-router.post('/:id/reprocess-page', async (req, res) => {
+router.post('/:id/reprocess-page', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
     if (!article.uploadedPdf) return res.status(400).json({ error: 'No PDF associated with this article' });
 
@@ -258,9 +282,9 @@ router.post('/:id/reprocess-page', async (req, res) => {
 });
 
 // Reprocess Layout & OCR for SELECTED pages (batch)
-router.post('/:id/reprocess-selected', async (req, res) => {
+router.post('/:id/reprocess-selected', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
     if (!article.uploadedPdf) return res.status(400).json({ error: 'No PDF associated with this article' });
 
@@ -297,9 +321,9 @@ router.post('/:id/reprocess-selected', async (req, res) => {
  * Translate article to Hindi and English.
  * POST body (optional): { targetLangs: ["hi", "en"], originalLanguage: "as", agent: "chatgpt-4" }
  */
-router.post('/:id/translate', async (req, res) => {
+router.post('/:id/translate', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
     if (!article.pageTexts) return res.status(400).json({ error: 'Article has no text content to translate' });
 
@@ -333,9 +357,9 @@ router.post('/:id/translate', async (req, res) => {
  * STEP 4: Finalize, Monetize & Publish
  * Body: { price: float, freePagesCount: int }
  */
-router.post('/:id/monetize-and-publish', async (req, res) => {
+router.post('/:id/monetize-and-publish', authenticatePublisher, async (req, res) => {
   try {
-    const article = await Article.findByPk(req.params.id);
+    const article = await Article.findOne({ where: { id: req.params.id, authorId: req.user.id } });
     if (!article) return res.status(404).json({ error: 'Article not found' });
     
     // Ensure OCR is actually complete before allowing publish

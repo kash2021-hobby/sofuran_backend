@@ -99,7 +99,7 @@ const renderPdfPagesOnly = async (filePath, articleId, Article) => {
  * @param {string[]} pageTypes - Array of page types: "cover", "poem", "normal"
  * @param {Object} Article - Sequelize Article model
  */
-const processClassifiedPages = async (articleId, pageTypes, Article, agent = 'default') => {
+const processClassifiedPages = async (articleId, pageTypes, Article) => {
   try {
     const article = await Article.findByPk(articleId);
     if (!article || !article.uploadedPdf) {
@@ -117,7 +117,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article, agent = 'de
       pageTypes: JSON.stringify(pageTypes)
     }, { where: { id: articleId } });
 
-    console.log(`[Processor] Starting classified processing for article ${articleId} (Agent: ${agent}, ${pageUrls.length} pages)...`);
+    console.log(`[Processor] Starting classified processing for article ${articleId} (${pageUrls.length} pages)...`);
 
     // Check for OCR availability
     let useOcr = false;
@@ -181,7 +181,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article, agent = 'de
         }
 
         if (pageImagePath && fs.existsSync(pageImagePath)) {
-          const poemFlow = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
+          const poemFlow = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum);
           pageTexts.push(poemFlow);
         } else {
           pageTexts.push({
@@ -214,7 +214,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article, agent = 'de
         }
 
         if (pageImagePath && fs.existsSync(pageImagePath)) {
-          const layoutFlow = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
+          const layoutFlow = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum, filePath);
           pageTexts.push(layoutFlow);
         } else {
           pageTexts.push({
@@ -285,7 +285,7 @@ const processClassifiedPages = async (articleId, pageTypes, Article, agent = 'de
 /**
  * STEP 2.5: Reprocess a Single Page
  */
-const processSingleClassifiedPage = async (articleId, pageIndex, Article, agent = 'default') => {
+const processSingleClassifiedPage = async (articleId, pageIndex, Article) => {
   try {
     const article = await Article.findByPk(articleId);
     if (!article || !article.uploadedPdf) return;
@@ -340,9 +340,9 @@ const processSingleClassifiedPage = async (articleId, pageIndex, Article, agent 
 
       if (pageImagePath && fs.existsSync(pageImagePath)) {
         if (pageType === 'poem') {
-          newPageResult = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
+          newPageResult = await extractPoemLayout(pageImagePath, pageRawText, articleId, pageNum, filePath);
         } else {
-          newPageResult = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum, agent);
+          newPageResult = await extractStructuredLayout(pageImagePath, pageRawText, articleId, pageNum, filePath);
         }
       } else {
         newPageResult = [{ type: 'text', format: pageType === 'poem' ? 'poem' : 'paragraph', content: pageRawText }];
@@ -369,7 +369,7 @@ const processSingleClassifiedPage = async (articleId, pageIndex, Article, agent 
  * Legacy: Background renderer for backward compatibility (used by reprocess).
  * Processes all pages as "normal" type.
  */
-const renderPdfPages = async (filePath, articleId, Article, agent = 'default') => {
+const renderPdfPages = async (filePath, articleId, Article) => {
   // First render the page images
   await renderPdfPagesOnly(filePath, articleId, Article);
   
@@ -378,7 +378,7 @@ const renderPdfPages = async (filePath, articleId, Article, agent = 'default') =
   const pageUrls = article.pages ? JSON.parse(article.pages) : [];
   const allNormal = pageUrls.map(() => 'normal');
   
-  await processClassifiedPages(articleId, allNormal, Article, agent);
+  await processClassifiedPages(articleId, allNormal, Article);
 };
 
 // Self-healing migration to extract text for existing uploaded PDFs
